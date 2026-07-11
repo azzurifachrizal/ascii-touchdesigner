@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>MediaPipe x TouchDesigner | Quad Jari Dinamis</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, sans-serif;
+      touch-action: none;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      position: fixed;
+      top: 0;
+      left: 0;
+    }
+    
+    .container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+    }
+    
+    canvas {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #111;
+    }
+    
+    .info-panel {
+      position: absolute;
+      bottom: max(15px, env(safe-area-inset-bottom, 15px));
+      left: max(15px, env(safe-area-inset-left, 15px));
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      color: #0ff;
+      padding: 8px 14px;
+      border-radius: 15px;
+      font-size: clamp(10px, 2vw, 13px);
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      z-index: 10;
+    }
+    
+    .effect-name {
+      font-weight: bold;
+      color: #fff;
+      text-shadow: 0 0 6px cyan;
+      letter-spacing: 0.5px;
+      font-size: clamp(11px, 2.2vw, 14px);
+    }
+    
+    .gesture-status {
+      color: #aaa;
+      font-size: clamp(9px, 1.8vw, 11px);
+      transition: color 0.3s ease;
+    }
+    
+    @media (max-width: 480px) {
+      .info-panel {
+        padding: 6px 10px;
+        border-radius: 12px;
+        bottom: max(10px, env(safe-area-inset-bottom, 10px));
+        left: max(10px, env(safe-area-inset-left, 10px));
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <canvas id="outputCanvas"></canvas>
+    <div class="info-panel" id="infoPanel">
+      <span class="effect-name" id="effectDisplay">🔮 Efek: Invert / Negative</span>
+      <span class="gesture-status" id="gestureStatus">👐 Buka tangan untuk ganti efek</span>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <script>
+    (function() {
+      // --- Deteksi Device ---
+      const isMobile = /Android|iPhone|iPad|iPod|webOS/i.test(navigator.userAgent);
+      
+      // --- Elemen UI ---
+      const canvas = document.getElementById('outputCanvas');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      const effectDisplay = document.getElementById('effectDisplay');
+      const gestureStatus = document.getElementById('gestureStatus');
+      const container = document.querySelector('.container');
+
+      // --- State Global ---
+      let fingerPoints = {
+        leftThumb: null,
+        leftIndex: null,
+        rightIndex: null,
+        rightThumb: null
+      };
+
+      // Video element
+      const video = document.createElement('video');
+      video.setAttribute('playsinline', '');
+      video.setAttribute('autoplay', '');
+      video.setAttribute('muted', '');
+      video.style.display = 'none';
+      document.body.appendChild(video);
+
+      // HANYA SATU offscreen canvas untuk efek
+      const offscreen = document.createElement('canvas');
+      const offCtx = offscreen.getContext('2d');
+
+      // Dimensi - KUALITAS TINGGI
+      const TARGET_WIDTH = isMobile ? 640 : 960;
+      const TARGET_HEIGHT = isMobile ? 480 : 720;
+      let canvasWidth = TARGET_WIDTH;
+      let canvasHeight = TARGET_HEIGHT;
+      
+      // --- State Efek dan Gestur ---
+      const effects = [
+        { name: 'Invert', id: 'invert', lineColor: '#87CEEB', lineGlow: 'rgba(135,206,235,0.7)' },
+        { name: 'Glitch', id: 'glitch', lineColor: '#FF3131', lineGlow: 'rgba(255,49,49,0.7)' },
+        { name: 'Hue Neon', id: 'hue', lineColor: '#39FF14', lineGlow: 'rgba(57,255,20,0.7)' },
+        { name: 'ASCII', id: 'ascii', lineColor: '#BF40BF', lineGlow: 'rgba(191,64,191,0.7)' }
+      ];
+      
+      let currentEffectIndex = 0;
+      
+      // State gestur - disederhanakan
+      let handsWereClose = false;
+      let gestureCooldown = 0;
+      const CLOSE_THRESHOLD = 0.13;
+
+      // ASCII chars
+      const asciiChars = ['@', '#', 'W', '8', 'o', ':', '.', ' '];
+
+      // --- Update UI ---
+      function updateUI() {
+        effectDisplay.textContent = `🔮 ${effects[currentEffectIndex].name}`;
+        
+        if (gestureCooldown > 0) {
+          gestureStatus.textContent = '⏳ Cooldown...';
+          gestureStatus.style.color = '#FFA500';
+        } else if (handsWereClose) {
+          gestureStatus.textContent = '🤝 Buka tangan!';
+          gestureStatus.style.color = '#FFD700';
+        } else {
+          gestureStatus.textContent = '👐 Dekatkan tangan';
+          gestureStatus.style.color = '#aaa';
+        }
+      }
+
+      // --- Deteksi gestur - super sederhana ---
+      function detectGesture() {
+        const pts = fingerPoints;
+        
+        if (!pts.leftThumb || !pts.leftIndex || !pts.rightIndex || !pts.rightThumb) {
+          handsWereClose = false;
+          return;
+        }
+        
+        if (gestureCooldown > 0) {
+          gestureCooldown--;
+          handsWereClose = false;
+          return;
+        }
+        
+        // Jarak antara ibu jari kiri dan kanan
+        const thumbDist = Math.sqrt(
+          Math.pow(pts.rightThumb.x - pts.leftThumb.x, 2) + 
+          Math.pow(pts.rightThumb.y - pts.leftThumb.y, 2)
+        );
+        
+        const nowClose = thumbDist < CLOSE_THRESHOLD;
+        
+        // Trigger: sebelumnya dekat, sekarang jauh
+        if (handsWereClose && !nowClose) {
+          currentEffectIndex = (currentEffectIndex + 1) % effects.length;
+          gestureCooldown = 20;
+        }
+        
+        handsWereClose = nowClose;
+      }
+
+      // --- Ekstrak titik jari ---
+      function extractFingerPoints(handsData) {
+        const points = {
+          leftThumb: null,
+          leftIndex: null,
+          rightIndex: null,
+          rightThumb: null
+        };
+
+        if (!handsData || handsData.length === 0) return points;
+
+        for (let i = 0; i < handsData.length; i++) {
+          const hand = handsData[i];
+          const keypoints = hand.keypoints;
+          
+          if (!keypoints || keypoints.length < 21) continue;
+          
+          const thumb = keypoints[4];
+          const index = keypoints[8];
+          
+          if (!thumb || !index) continue;
+          
+          // Hanya filter NaN
+          if (isNaN(thumb.x) || isNaN(thumb.y) || isNaN(index.x) || isNaN(index.y)) continue;
+          
+          if (hand.handedness === 'Left') {
+            // Mirror koordinat untuk tampilan normal (tidak mirror)
+            points.leftThumb = { x: 1 - thumb.x, y: thumb.y };
+            points.leftIndex = { x: 1 - index.x, y: index.y };
+          } else if (hand.handedness === 'Right') {
+            // Mirror koordinat untuk tampilan normal (tidak mirror)
+            points.rightThumb = { x: 1 - thumb.x, y: thumb.y };
+            points.rightIndex = { x: 1 - index.x, y: index.y };
+          }
+        }
+        
+        return points;
+      }
+
+      // --- GAMBAR SCENE UTAMA - dioptimasi ---
+      function drawScene() {
+        if (!video.videoWidth || !video.videoHeight) {
+          requestAnimationFrame(drawScene);
+          return;
+        }
+
+        // Update ukuran canvas hanya jika perlu
+        if (canvas.width !== canvasWidth) {
+          canvas.width = canvasWidth;
+          canvas.height = canvasHeight;
+          offscreen.width = canvasWidth;
+          offscreen.height = canvasHeight;
+        }
+
+        detectGesture();
+        
+        const pts = fingerPoints;
+        const hasAll = pts.leftThumb && pts.leftIndex && pts.rightIndex && pts.rightThumb;
+
+        // === BACKGROUND: Video NORMAL (flip horizontal) ===
+        ctx.save();
+        ctx.translate(canvasWidth, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, canvasWidth, canvasHeight);
+        ctx.restore();
+
+        if (hasAll) {
+          // Konversi ke pixel - tanpa clamp untuk tracking bebas
+          const p1 = { x: pts.leftThumb.x * canvasWidth, y: pts.leftThumb.y * canvasHeight };
+          const p2 = { x: pts.leftIndex.x * canvasWidth, y: pts.leftIndex.y * canvasHeight };
+          const p3 = { x: pts.rightIndex.x * canvasWidth, y: pts.rightIndex.y * canvasHeight };
+          const p4 = { x: pts.rightThumb.x * canvasWidth, y: pts.rightThumb.y * canvasHeight };
+
+          // === EFEK: Generate ke offscreen (juga flip horizontal) ===
+          offCtx.save();
+          offCtx.translate(canvasWidth, 0);
+          offCtx.scale(-1, 1);
+          offCtx.drawImage(video, 0, 0, canvasWidth, canvasHeight);
+          offCtx.restore();
+          applyEffect();
+
+          // === QUAD dengan clipping ===
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.lineTo(p3.x, p3.y);
+          ctx.lineTo(p4.x, p4.y);
+          ctx.closePath();
+          ctx.clip();
+          ctx.drawImage(offscreen, 0, 0, canvasWidth, canvasHeight);
+          ctx.restore();
+
+          // === GARIS OUTLINE tipis ===
+          const ef = effects[currentEffectIndex];
+          ctx.save();
+          ctx.strokeStyle = ef.lineColor;
+          ctx.lineWidth = isMobile ? 1.5 : 2;
+          ctx.shadowColor = ef.lineGlow;
+          ctx.shadowBlur = 5;
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.lineTo(p3.x, p3.y);
+          ctx.lineTo(p4.x, p4.y);
+          ctx.closePath();
+          ctx.stroke();
+          ctx.restore();
+
+          // === TITIK SUDUT + KOORDINAT ===
+          drawCorners(p1, p2, p3, p4, pts, ef);
+        }
+
+        updateUI();
+        requestAnimationFrame(drawScene);
+      }
+
+      // --- Gambar titik sudut ---
+      function drawCorners(p1, p2, p3, p4, pts, ef) {
+        const corners = [
+          { p: p1, data: pts.leftThumb, label: 'LT' },
+          { p: p2, data: pts.leftIndex, label: 'LI' },
+          { p: p3, data: pts.rightIndex, label: 'RI' },
+          { p: p4, data: pts.rightThumb, label: 'RT' }
+        ];
+        
+        const dotSize = isMobile ? 3 : 4;
+        const fontSize = isMobile ? 8 : 10;
+        
+        corners.forEach(c => {
+          // Titik
+          ctx.fillStyle = ef.lineColor;
+          ctx.shadowColor = ef.lineGlow;
+          ctx.shadowBlur = 4;
+          ctx.beginPath();
+          ctx.arc(c.p.x, c.p.y, dotSize, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Inner dot putih
+          ctx.fillStyle = '#fff';
+          ctx.shadowBlur = 0;
+          ctx.beginPath();
+          ctx.arc(c.p.x, c.p.y, dotSize * 0.4, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Koordinat
+          const tx = c.data.x.toFixed(2);
+          const ty = c.data.y.toFixed(2);
+          ctx.fillStyle = ef.lineColor;
+          ctx.font = `${fontSize}px monospace`;
+          ctx.textAlign = 'center';
+          ctx.shadowColor = 'rgba(0,0,0,0.7)';
+          ctx.shadowBlur = 2;
+          ctx.fillText(`${c.label}(${tx},${ty})`, c.p.x, c.p.y - (isMobile ? 12 : 16));
+          ctx.shadowBlur = 0;
+        });
+      }
+
+      // --- Apply efek ke offscreen ---
+      function applyEffect() {
+        const id = effects[currentEffectIndex].id;
+        
+        switch (id) {
+          case 'invert':
+            invertEffect();
+            break;
+          case 'glitch':
+            glitchEffect();
+            break;
+          case 'hue':
+            hueEffect();
+            break;
+          case 'ascii':
+            asciiEffect();
+            break;
+        }
+      }
+
+      // --- Invert (paling ringan) ---
+      function invertEffect() {
+        const imgData = offCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        const d = imgData.data;
+        for (let i = 0; i < d.length; i += 4) {
+          d[i] = 255 - d[i];
+          d[i+1] = 255 - d[i+1];
+          d[i+2] = 255 - d[i+2];
+        }
+        offCtx.putImageData(imgData, 0, 0);
+      }
+
+      // --- Glitch ---
+      function glitchEffect() {
+        const imgData = offCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        const src = new Uint8ClampedArray(imgData.data);
+        const dst = new Uint8ClampedArray(src.length);
+        const w = canvasWidth;
+        const h = canvasHeight;
+        
+        for (let y = 0; y < h; y++) {
+          const shift = Math.floor((Math.random() - 0.5) * 20);
+          for (let x = 0; x < w; x++) {
+            const sx = (x + shift + w) % w;
+            const si = (y * w + sx) * 4;
+            const di = (y * w + x) * 4;
+            dst[di] = src[si];
+            dst[di+1] = src[si+1];
+            dst[di+2] = src[si+2];
+            dst[di+3] = 255;
+          }
+        }
+        offCtx.putImageData(new ImageData(dst, w, h), 0, 0);
+      }
+
+      // --- Hue Rotation (dioptimasi) ---
+      function hueEffect() {
+        const imgData = offCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        const d = imgData.data;
+        const t = performance.now() / 400;
+        
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i] / 255;
+          const g = d[i+1] / 255;
+          const b = d[i+2] / 255;
+          
+          const max = Math.max(r, g, b);
+          const min = Math.min(r, g, b);
+          const delta = max - min;
+          
+          if (delta === 0) continue;
+          
+          let h = 0;
+          if (max === r) h = ((g - b) / delta) % 6;
+          else if (max === g) h = (b - r) / delta + 2;
+          else h = (r - g) / delta + 4;
+          
+          h = (h * 60 + t * 360) % 360;
+          if (h < 0) h += 360;
+          
+          const s = delta / max;
+          const v = max;
+          
+          // Color grading
+          if (v > 0.6) h = h * 0.5 + 55 * 0.5;
+          else if (v < 0.4) h = h * 0.5 + 275 * 0.5;
+          
+          const c = v * s;
+          const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+          const m = v - c;
+          
+          let rr, gg, bb;
+          if (h < 60) { rr = c; gg = x; bb = 0; }
+          else if (h < 120) { rr = x; gg = c; bb = 0; }
+          else if (h < 180) { rr = 0; gg = c; bb = x; }
+          else if (h < 240) { rr = 0; gg = x; bb = c; }
+          else if (h < 300) { rr = x; gg = 0; bb = c; }
+          else { rr = c; gg = 0; bb = x; }
+          
+          d[i] = Math.round((rr + m) * 255);
+          d[i+1] = Math.round((gg + m) * 255);
+          d[i+2] = Math.round((bb + m) * 255);
+        }
+        offCtx.putImageData(imgData, 0, 0);
+      }
+
+      // --- ASCII ---
+      function asciiEffect() {
+        const imgData = offCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+        const step = isMobile ? 8 : 6;
+        
+        offCtx.fillStyle = '#000';
+        offCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+        offCtx.font = `${step * 0.8}px monospace`;
+        offCtx.textAlign = 'center';
+        offCtx.textBaseline = 'middle';
+        
+        for (let y = 0; y < canvasHeight; y += step) {
+          for (let x = 0; x < canvasWidth; x += step) {
+            let sum = 0, count = 0, sr = 0, sg = 0, sb = 0;
+            
+            for (let dy = 0; dy < step && y + dy < canvasHeight; dy++) {
+              for (let dx = 0; dx < step && x + dx < canvasWidth; dx++) {
+                const idx = ((y + dy) * canvasWidth + (x + dx)) * 4;
+                sr += imgData.data[idx];
+                sg += imgData.data[idx + 1];
+                sb += imgData.data[idx + 2];
+                count++;
+              }
+            }
+            
+            if (count === 0) continue;
+            const bright = (sr + sg + sb) / (3 * count);
+            const ci = Math.floor((bright / 255) * (asciiChars.length - 1));
+            
+            offCtx.fillStyle = `rgb(${Math.round(sr/count)},${Math.round(sg/count)},${Math.round(sb/count)})`;
+            offCtx.fillText(asciiChars[ci], x + step/2, y + step/2);
+          }
+        }
+      }
+
+      // --- Callback MediaPipe ---
+      function onHandsResults(results) {
+        if (results.multiHandLandmarks && results.multiHandedness) {
+          const handsData = [];
+          for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+            handsData.push({
+              keypoints: results.multiHandLandmarks[i],
+              handedness: results.multiHandedness[i].label
+            });
+          }
+          fingerPoints = extractFingerPoints(handsData);
+        } else {
+          fingerPoints = {
+            leftThumb: null,
+            leftIndex: null,
+            rightIndex: null,
+            rightThumb: null
+          };
+        }
+      }
+
+      // --- Inisialisasi ---
+      async function initMediaPipe() {
+        canvas.width = canvasWidth;
+        canvas.height = canvasHeight;
+        offscreen.width = canvasWidth;
+        offscreen.height = canvasHeight;
+        
+        const hands = new Hands({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 0,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.4
+        });
+        
+        hands.onResults(onHandsResults);
+        
+        // Kamera - KUALITAS TINGGI dengan pencahayaan optimal
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: 'user',
+            width: { ideal: TARGET_WIDTH }, 
+            height: { ideal: TARGET_HEIGHT },
+            frameRate: { ideal: 30 },
+            aspectRatio: { ideal: 4/3 },
+            resizeMode: 'none'
+          } 
+        });
+        
+        // Optimalkan track kamera jika didukung
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoTrack && 'getCapabilities' in videoTrack) {
+          const capabilities = videoTrack.getCapabilities();
+          const settings = {};
+          
+          if (capabilities.width?.max > TARGET_WIDTH) {
+            settings.width = Math.min(capabilities.width.max, TARGET_WIDTH);
+          }
+          if (capabilities.height?.max > TARGET_HEIGHT) {
+            settings.height = Math.min(capabilities.height.max, TARGET_HEIGHT);
+          }
+          if (capabilities.frameRate?.max >= 30) {
+            settings.frameRate = 30;
+          }
+          
+          try {
+            await videoTrack.applyConstraints({ advanced: [settings] });
+          } catch (e) {
+            console.log('Optimasi kamera terbatas:', e.message);
+          }
+        }
+        
+        video.srcObject = stream;
+        video.play();
+        
+        await new Promise(resolve => video.onloadedmetadata = resolve);
+        
+        const camera = new Camera(video, {
+          onFrame: async () => {
+            await hands.send({ image: video });
+          },
+          width: TARGET_WIDTH,
+          height: TARGET_HEIGHT
+        });
+        camera.start();
+        
+        requestAnimationFrame(drawScene);
+      }
+
+      // --- Start ---
+      window.addEventListener('load', () => {
+        initMediaPipe().catch(err => {
+          console.error('Error:', err);
+        });
+      });
+
+    })();
+  </script>
+</body>
+</html>
